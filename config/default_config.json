@@ -1,0 +1,46 @@
+{
+  "validation": {
+    "pub_get_timeout": 300,
+    "build_timeout": 600,
+    "analyze_timeout": 120,
+    "max_retries": 3,
+    "retry_delay": 5.0,
+    "exponential_backoff": true,
+    "build_targets": ["android"],
+    "build_modes": ["debug"],
+    "run_pub_get": true,
+    "run_analyze": true,
+    "run_build": true,
+    "run_test": false,
+    "flutter_channel": "stable",
+    "use_isolated_environment": true,
+    "preserve_build_artifacts": false,
+    "max_concurrent_builds": 2,
+    "memory_limit_mb": 4096,
+    "cpu_limit_percent": 80
+  },
+  "ml": {
+    "max_candidates": 10,
+    "optimization_goals": {
+      "stability": 0.4,
+      "compatibility": 0.3,
+      "security": 0.2,
+      "performance": 0.1
+    },
+    "state_dim": 128,
+    "action_dim": 100,
+    "learning_rate": 0.001,
+    "batch_size": 32,
+    "memory_size": 10000,
+    "epsilon_start": 1.0,
+    "epsilon_end": 0.01,
+    "epsilon_decay": 0.995,
+    "target_update": 10,
+    "gamma": 0.99
+  },
+  "logging": {
+    "level": "INFO",
+    "file": null
+  }
+}
+
