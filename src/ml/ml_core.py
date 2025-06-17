@@ -90,7 +90,8 @@ class DependencyStateEncoder:
     def encode_state(self, dependency_graph: Any, current_selection: Dict[str, str] = None) -> np.ndarray:
         """Encode dependency graph state into feature vector."""
         if not self.is_fitted:
-            raise ValueError("Encoder must be fitted before encoding states")
+            # Auto-fit on first use with the current graph
+            self.fit([dependency_graph])
         
         features = self._extract_graph_features(dependency_graph, current_selection)
         return self.scaler.transform([features])[0]

@@ -1,18 +1,15 @@
 """
-Core dependency analysis engine for Flutter projects.
-Handles parsing, analysis, and graph construction of pubspec.yaml dependencies.
+Advanced dependency analysis for Flutter projects.
+Handles complex dependency graphs, version constraints, and conflict detection.
 """
 
 import yaml
-import re
-import os
 import logging
-from typing import Dict, List, Optional, Set, Tuple, Any
+import networkx as nx
+import semantic_version
+from typing import Dict, List, Set, Optional, Tuple, Any
 from dataclasses import dataclass, field
 from pathlib import Path
-import networkx as nx
-from packaging import version
-import semantic_version
 
 
 @dataclass
@@ -20,48 +17,47 @@ class DependencyConstraint:
     """Represents a dependency version constraint."""
     name: str
     constraint: str
-    constraint_type: str  # 'caret', 'range', 'exact', 'any'
-    min_version: Optional[str] = None
-    max_version: Optional[str] = None
+    constraint_type: str = field(init=False)
+    min_version: Optional[str] = field(default=None, init=False)
+    max_version: Optional[str] = field(default=None, init=False)
     is_dev_dependency: bool = False
     is_override: bool = False
     platform_specific: Optional[str] = None
     
     def __post_init__(self):
-        """Parse the constraint string to extract version bounds."""
-        self._parse_constraint()
-    
-    def _parse_constraint(self):
-        """Parse version constraint string into structured format."""
-        constraint = self.constraint.strip()
-        
-        if constraint == 'any' or constraint == '':
-            self.constraint_type = 'any'
+        """Parse constraint after initialization."""
+        # Handle special constraint types
+        if self.constraint in ['any', 'path', 'git', 'sdk']:
+            self.constraint_type = self.constraint
             return
         
+        # Ensure constraint is a string
+        if not isinstance(self.constraint, str):
+            logging.warning(f"Non-string constraint for {self.name}: {self.constraint}")
+            self.constraint = str(self.constraint)
+        
         # Handle caret syntax (^1.2.3)
-        if constraint.startswith('^'):
+        if self.constraint.startswith('^'):
             self.constraint_type = 'caret'
-            base_version = constraint[1:]
+            base_version = self.constraint[1:]
             try:
                 parsed = semantic_version.Version(base_version)
                 self.min_version = base_version
-                # Caret allows patch and minor updates but not major
                 self.max_version = f"{parsed.major + 1}.0.0"
             except ValueError:
-                logging.warning(f"Invalid caret version: {constraint}")
+                logging.warning(f"Invalid caret version for {self.name}: {self.constraint}")
                 self.constraint_type = 'exact'
                 self.min_version = self.max_version = base_version
         
         # Handle range syntax (>=1.2.3 <2.0.0)
-        elif '>=' in constraint or '<=' in constraint or '>' in constraint or '<' in constraint:
+        elif '>=' in self.constraint or '<=' in self.constraint or '>' in self.constraint or '<' in self.constraint:
             self.constraint_type = 'range'
-            self._parse_range_constraint(constraint)
+            self._parse_range_constraint(self.constraint)
         
         # Handle exact version
         else:
             self.constraint_type = 'exact'
-            self.min_version = self.max_version = constraint
+            self.min_version = self.max_version = self.constraint
     
     def _parse_range_constraint(self, constraint: str):
         """Parse range constraint like '>=1.2.3 <2.0.0'."""
@@ -91,6 +87,9 @@ class DependencyConstraint:
             if self.constraint_type == 'any':
                 return True
             
+            if self.constraint_type in ['path', 'git', 'sdk']:
+                return True  # These are always satisfied for resolution purposes
+            
             if self.constraint_type == 'exact':
                 return version_str == self.min_version
             
@@ -109,7 +108,7 @@ class DependencyConstraint:
             return True
             
         except ValueError:
-            logging.warning(f"Invalid version format: {version_str}")
+            # If version parsing fails, assume it doesn't satisfy
             return False
 
 
@@ -123,21 +122,19 @@ class ProjectMetadata:
     dart_sdk_constraint: Optional[str] = None
     platforms: Set[str] = field(default_factory=set)
     project_path: Optional[Path] = None
-    
-    def __post_init__(self):
-        """Initialize default platforms if none specified."""
-        if not self.platforms:
-            self.platforms = {'android', 'ios'}  # Default Flutter platforms
 
 
-@dataclass
 class DependencyGraph:
-    """Represents the complete dependency graph for a project."""
-    project_metadata: ProjectMetadata
-    dependencies: Dict[str, DependencyConstraint] = field(default_factory=dict)
-    dev_dependencies: Dict[str, DependencyConstraint] = field(default_factory=dict)
-    dependency_overrides: Dict[str, DependencyConstraint] = field(default_factory=dict)
-    graph: nx.DiGraph = field(default_factory=nx.DiGraph)
+    """Represents a dependency graph for a Flutter project."""
+    
+    def __init__(self, project_metadata: ProjectMetadata):
+        self.project_metadata = project_metadata
+        self.dependencies: Dict[str, DependencyConstraint] = {}
+        self.dev_dependencies: Dict[str, DependencyConstraint] = {}
+        self.dependency_overrides: Dict[str, DependencyConstraint] = {}
+        
+        # NetworkX graph for advanced analysis
+        self.graph = nx.DiGraph()
     
     def add_dependency(self, dep: DependencyConstraint):
         """Add a dependency to the graph."""
@@ -200,54 +197,45 @@ class PubspecParser:
     def __init__(self):
         self.logger = logging.getLogger(__name__)
     
-    def parse_pubspec_file(self, file_path: Path) -> DependencyGraph:
+    def parse_pubspec_file(self, pubspec_path: Path) -> DependencyGraph:
         """Parse a pubspec.yaml file and return dependency graph."""
         try:
-            with open(file_path, 'r', encoding='utf-8') as f:
+            with open(pubspec_path, 'r', encoding='utf-8') as f:
                 content = yaml.safe_load(f)
             
-            return self.parse_pubspec_content(content, file_path.parent)
+            return self.parse_pubspec_content(content, pubspec_path.parent)
             
-        except FileNotFoundError:
-            raise FileNotFoundError(f"pubspec.yaml not found at {file_path}")
-        except yaml.YAMLError as e:
-            raise ValueError(f"Invalid YAML in pubspec.yaml: {e}")
+        except Exception as e:
+            self.logger.error(f"Failed to parse {pubspec_path}: {e}")
+            raise
     
     def parse_pubspec_content(self, content: Dict[str, Any], project_path: Path) -> DependencyGraph:
-        """Parse pubspec.yaml content into dependency graph."""
+        """Parse pubspec content and return dependency graph."""
         # Extract project metadata
         metadata = self._extract_project_metadata(content, project_path)
         
         # Create dependency graph
-        dep_graph = DependencyGraph(project_metadata=metadata)
+        dep_graph = DependencyGraph(metadata)
         
-        # Parse dependencies
+        # Parse dependency sections
         if 'dependencies' in content:
-            self._parse_dependency_section(
-                content['dependencies'], dep_graph, is_dev=False
-            )
+            self._parse_dependency_section(content['dependencies'], dep_graph, is_dev=False)
         
-        # Parse dev dependencies
         if 'dev_dependencies' in content:
-            self._parse_dependency_section(
-                content['dev_dependencies'], dep_graph, is_dev=True
-            )
+            self._parse_dependency_section(content['dev_dependencies'], dep_graph, is_dev=True)
         
-        # Parse dependency overrides
         if 'dependency_overrides' in content:
-            self._parse_dependency_section(
-                content['dependency_overrides'], dep_graph, is_override=True
-            )
+            self._parse_dependency_section(content['dependency_overrides'], dep_graph, is_override=True)
         
         return dep_graph
     
     def _extract_project_metadata(self, content: Dict[str, Any], project_path: Path) -> ProjectMetadata:
-        """Extract project metadata from pubspec.yaml content."""
+        """Extract project metadata from pubspec content."""
         name = content.get('name', 'unknown')
         version = content.get('version', '0.0.0')
         description = content.get('description')
         
-        # Extract SDK constraints
+        # Extract environment constraints
         environment = content.get('environment', {})
         flutter_constraint = environment.get('flutter')
         dart_constraint = environment.get('sdk')
@@ -298,24 +286,32 @@ class PubspecParser:
             elif isinstance(constraint_info, dict):
                 # Handle complex dependency specifications
                 if 'version' in constraint_info:
-                    constraint = constraint_info['version']
+                    # Ensure we extract the version string properly
+                    version_value = constraint_info['version']
+                    if isinstance(version_value, str):
+                        constraint = version_value
+                    else:
+                        # Handle nested version objects
+                        constraint = str(version_value)
                 elif 'path' in constraint_info:
                     constraint = 'path'  # Local path dependency
                 elif 'git' in constraint_info:
                     constraint = 'git'  # Git dependency
+                elif 'sdk' in constraint_info:
+                    constraint = 'sdk'  # SDK dependency
                 else:
                     constraint = 'any'
                 
                 platform_specific = constraint_info.get('platform')
             else:
-                constraint = 'any'
+                # Handle other types by converting to string
+                constraint = str(constraint_info) if constraint_info is not None else 'any'
                 platform_specific = None
             
             # Create dependency constraint
             dep_constraint = DependencyConstraint(
                 name=name,
                 constraint=constraint,
-                constraint_type='',  # Will be set in __post_init__
                 is_dev_dependency=is_dev,
                 is_override=is_override,
                 platform_specific=platform_specific
@@ -348,66 +344,75 @@ class DependencyAnalyzer:
         
         return graphs
     
-    def find_cross_project_conflicts(self, graphs: List[DependencyGraph]) -> Dict[str, List[DependencyConstraint]]:
-        """Find dependency conflicts across multiple projects."""
-        all_dependencies = {}
+    def find_cross_project_conflicts(self, graphs: List[DependencyGraph]) -> List[Dict[str, Any]]:
+        """Find conflicts across multiple projects."""
+        conflicts = []
         
-        # Collect all dependencies from all projects
+        # Collect all dependencies across projects
+        all_project_deps = {}
         for graph in graphs:
-            for dep_name, dep_constraint in graph.get_all_dependencies().items():
-                if dep_name not in all_dependencies:
-                    all_dependencies[dep_name] = []
-                all_dependencies[dep_name].append(dep_constraint)
+            project_name = graph.project_metadata.name
+            all_project_deps[project_name] = graph.get_all_dependencies()
         
-        # Find conflicts
-        conflicts = {}
-        for dep_name, constraints in all_dependencies.items():
-            if len(constraints) > 1:
-                # Check if all constraints are compatible
-                unique_constraints = set(c.constraint for c in constraints)
-                if len(unique_constraints) > 1:
-                    conflicts[dep_name] = constraints
+        # Find packages used in multiple projects with different constraints
+        package_usage = {}
+        for project_name, deps in all_project_deps.items():
+            for dep_name, dep_constraint in deps.items():
+                if dep_name not in package_usage:
+                    package_usage[dep_name] = []
+                package_usage[dep_name].append((project_name, dep_constraint))
+        
+        # Identify conflicts
+        for package_name, usage_list in package_usage.items():
+            if len(usage_list) > 1:
+                constraints = [usage[1].constraint for usage in usage_list]
+                if len(set(constraints)) > 1:
+                    conflicts.append({
+                        'package': package_name,
+                        'usage': usage_list,
+                        'conflict_type': 'cross_project_version_mismatch'
+                    })
         
         return conflicts
     
-    def suggest_version_resolution(self, conflicts: Dict[str, List[DependencyConstraint]]) -> Dict[str, str]:
-        """Suggest version resolutions for conflicts."""
-        suggestions = {}
+    def suggest_resolution_strategy(self, conflicts: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Suggest resolution strategies for conflicts."""
+        strategies = {
+            'unified_versions': {},
+            'dependency_overrides': {},
+            'platform_specific': {}
+        }
         
-        for dep_name, constraints in conflicts.items():
-            # Find the most restrictive constraint that satisfies all requirements
-            suggested_version = self._find_compatible_version(constraints)
-            if suggested_version:
-                suggestions[dep_name] = suggested_version
-            else:
-                # If no compatible version found, suggest the latest constraint
-                latest_constraint = max(constraints, key=lambda c: c.constraint)
-                suggestions[dep_name] = latest_constraint.constraint
+        for conflict in conflicts:
+            package_name = conflict['package']
+            usage_list = conflict['usage']
+            
+            # Find the most restrictive compatible version
+            all_constraints = [usage[1] for usage in usage_list]
+            
+            # Simple strategy: use the highest version that satisfies all constraints
+            # This is a simplified implementation - a real resolver would be more sophisticated
+            versions = []
+            for constraint in all_constraints:
+                if constraint.constraint_type == 'exact':
+                    versions.append(constraint.min_version)
+                elif constraint.constraint_type == 'caret' and constraint.min_version:
+                    versions.append(constraint.min_version)
+            
+            if versions:
+                # Sort versions and pick the highest
+                try:
+                    sorted_versions = sorted(versions, key=semantic_version.Version, reverse=True)
+                    strategies['unified_versions'][package_name] = sorted_versions[0]
+                except ValueError:
+                    # If version parsing fails, use the first version
+                    strategies['unified_versions'][package_name] = versions[0]
         
-        return suggestions
-    
-    def _find_compatible_version(self, constraints: List[DependencyConstraint]) -> Optional[str]:
-        """Find a version that satisfies all constraints."""
-        # This is a simplified implementation
-        # In a real system, this would query package repositories for available versions
-        
-        # For now, return the most restrictive constraint
-        exact_constraints = [c for c in constraints if c.constraint_type == 'exact']
-        if exact_constraints:
-            # If there are exact constraints, they must all be the same
-            versions = set(c.constraint for c in exact_constraints)
-            if len(versions) == 1:
-                return list(versions)[0]
-            else:
-                return None  # Conflicting exact versions
-        
-        # Handle caret and range constraints
-        # This would need more sophisticated logic in a real implementation
-        return None
+        return strategies
 
 
-def setup_logging():
-    """Setup logging configuration."""
+def setup_dependency_logging():
+    """Setup logging for dependency analysis."""
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -415,15 +420,17 @@ def setup_logging():
 
 
 if __name__ == "__main__":
-    setup_logging()
+    setup_dependency_logging()
     
     # Example usage
     analyzer = DependencyAnalyzer()
     
-    # This would be used to analyze actual Flutter projects
+    # This would be used with actual project paths
     # project_path = Path("/path/to/flutter/project")
     # graph = analyzer.analyze_project(project_path)
     # print(f"Analyzed project: {graph.project_metadata.name}")
     # print(f"Dependencies: {len(graph.dependencies)}")
-    # print(f"Conflicts: {graph.get_dependency_conflicts()}")
+    # print(f"Conflicts: {len(graph.get_dependency_conflicts())}")
+    
+    print("Dependency analyzer initialized successfully")
 

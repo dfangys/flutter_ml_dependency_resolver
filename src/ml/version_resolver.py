@@ -87,8 +87,8 @@ class PackageRepository:
         if self.session:
             await self.session.close()
     
-    async def get_package_info(self, package_name: str) -> Optional[PackageInfo]:
-        """Get package information from pub.dev."""
+    async def get_package_info(self, package_name: str, dependency_constraint: Optional[Any] = None) -> Optional[PackageInfo]:
+        """Get package information from pub.dev or handle local/private packages."""
         cache_key = f"package_info_{package_name}"
         
         # Check cache
@@ -96,6 +96,14 @@ class PackageRepository:
             cached_time, cached_data = self.cache[cache_key]
             if time.time() - cached_time < self.cache_ttl:
                 return cached_data
+        
+        # Check if this is a local or private package
+        if dependency_constraint and hasattr(dependency_constraint, 'constraint_type'):
+            if dependency_constraint.constraint_type in ['path', 'git', 'sdk']:
+                # Create a mock package info for local/private packages
+                package_info = self._create_local_package_info(package_name, dependency_constraint)
+                self.cache[cache_key] = (time.time(), package_info)
+                return package_info
         
         try:
             # Fetch from pub.dev API
@@ -108,13 +116,53 @@ class PackageRepository:
                     # Cache result
                     self.cache[cache_key] = (time.time(), package_info)
                     return package_info
+                elif response.status == 404:
+                    # Package not found on pub.dev - might be local/private
+                    self.logger.info(f"Package {package_name} not found on pub.dev (404) - treating as local/private package")
+                    package_info = self._create_local_package_info(package_name, dependency_constraint)
+                    self.cache[cache_key] = (time.time(), package_info)
+                    return package_info
                 else:
                     self.logger.warning(f"Failed to fetch package info for {package_name}: {response.status}")
                     return None
         
         except Exception as e:
             self.logger.error(f"Error fetching package info for {package_name}: {e}")
+            # Try to create local package info as fallback
+            if dependency_constraint:
+                package_info = self._create_local_package_info(package_name, dependency_constraint)
+                self.cache[cache_key] = (time.time(), package_info)
+                return package_info
             return None
+    
+    def _create_local_package_info(self, package_name: str, dependency_constraint: Optional[Any] = None) -> PackageInfo:
+        """Create package info for local or private packages."""
+        # Determine version based on constraint
+        if dependency_constraint and hasattr(dependency_constraint, 'constraint'):
+            if dependency_constraint.constraint_type == 'exact':
+                version = dependency_constraint.constraint
+            elif dependency_constraint.constraint_type == 'caret' and dependency_constraint.min_version:
+                version = dependency_constraint.min_version
+            elif dependency_constraint.constraint_type == 'range' and dependency_constraint.min_version:
+                version = dependency_constraint.min_version
+            else:
+                version = '1.0.0'  # Default version for local packages
+        else:
+            version = '1.0.0'
+        
+        return PackageInfo(
+            name=package_name,
+            versions=[version],
+            latest_version=version,
+            description=f"Local/private package: {package_name}",
+            popularity_score=0.0,
+            pub_points=0,
+            likes=0,
+            dependencies={},
+            dev_dependencies={},
+            platforms={'android', 'ios', 'web'},  # Assume all platforms for local packages
+            sdk_constraints={'dart': '>=2.17.0 <4.0.0', 'flutter': '>=3.0.0'}
+        )
     
     def _parse_package_data(self, data: Dict[str, Any]) -> PackageInfo:
         """Parse package data from pub.dev API response."""
@@ -154,9 +202,15 @@ class PackageRepository:
             sdk_constraints=sdk_constraints
         )
     
-    async def get_multiple_package_info(self, package_names: List[str]) -> Dict[str, PackageInfo]:
+    async def get_multiple_package_info(self, package_dependencies: Dict[str, Any]) -> Dict[str, PackageInfo]:
         """Get information for multiple packages concurrently."""
-        tasks = [self.get_package_info(name) for name in package_names]
+        tasks = []
+        package_names = []
+        
+        for name, constraint in package_dependencies.items():
+            tasks.append(self.get_package_info(name, constraint))
+            package_names.append(name)
+        
         results = await asyncio.gather(*tasks, return_exceptions=True)
         
         package_info = {}
@@ -328,10 +382,9 @@ class MLVersionResolver:
             
             # Get package information
             all_deps = dependency_graph.get_all_dependencies()
-            package_names = list(all_deps.keys())
             
             async with PackageRepository() as repo:
-                package_info = await repo.get_multiple_package_info(package_names)
+                package_info = await repo.get_multiple_package_info(all_deps)
             
             # Generate candidate resolutions
             candidates = await self._generate_resolution_candidates(
